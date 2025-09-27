@@ -29,6 +29,8 @@ class XLerobotVRTeleopConfig(TeleoperatorConfig):
     vr_enabled: bool = True
     vr_connection_timeout: float = 10.0  # VR连接超时时间(秒)
     vr_data_timeout: float = 5.0  # VR数据获取超时时间(秒)
+
+    kp : float = 1.0  # 位置控制比例增益
     
 
     xlevr_path: Optional[str] = "/home/cics/Desktop/codes/projects/XLeRobot/XLeVR"

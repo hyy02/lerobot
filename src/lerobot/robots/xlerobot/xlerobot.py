@@ -23,7 +23,7 @@ from typing import Any
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+# from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
     FeetechMotorsBus,
@@ -181,7 +181,7 @@ class XLerobot(Robot):
 
     def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
+            raise RuntimeError(f"{self} already connected")
 
         self.bus1.connect()
         self.bus2.connect()
@@ -286,26 +286,26 @@ class XLerobot(Robot):
         for name in self.left_arm_motors:
             self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
             # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.bus1.write("P_Coefficient", name, 10)
+            self.bus1.write("P_Coefficient", name, 12)
             # Set I_Coefficient and D_Coefficient to default value 0 and 32
             self.bus1.write("I_Coefficient", name, 0)
-            self.bus1.write("D_Coefficient", name, 8)
+            self.bus1.write("D_Coefficient", name, 16)
         
         for name in self.head_motors:
             self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
             # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.bus1.write("P_Coefficient", name, 10)
+            self.bus1.write("P_Coefficient", name, 12)
             # Set I_Coefficient and D_Coefficient to default value 0 and 32
             self.bus1.write("I_Coefficient", name, 0)
-            self.bus1.write("D_Coefficient", name, 8)
+            self.bus1.write("D_Coefficient", name, 16)
         
         for name in self.right_arm_motors:
             self.bus2.write("Operating_Mode", name, OperatingMode.POSITION.value)
             # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-            self.bus2.write("P_Coefficient", name, 10)
+            self.bus2.write("P_Coefficient", name, 12)
             # Set I_Coefficient and D_Coefficient to default value 0 and 32
             self.bus2.write("I_Coefficient", name, 0)
-            self.bus2.write("D_Coefficient", name, 8)
+            self.bus2.write("D_Coefficient", name, 16)
         
         for name in self.base_motors:
             self.bus2.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
@@ -498,7 +498,7 @@ class XLerobot(Robot):
 
     def get_observation(self, use_camera=True) -> dict[str, Any]:
         if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+            raise RuntimeError(f"{self} is not connected.")
 
         # Read actuators position for arm and vel for base
         start = time.perf_counter()
@@ -551,7 +551,7 @@ class XLerobot(Robot):
             np.ndarray: the action sent to the motors, potentially clipped.
         """
         if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+            raise RuntimeError(f"{self} is not connected.")
         
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         right_arm_pos = {k: v for k, v in action.items() if k.startswith("right_arm_") and k.endswith(".pos")}
@@ -610,7 +610,7 @@ class XLerobot(Robot):
 
     def disconnect(self):
         if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+            raise RuntimeError(f"{self} is not connected.")
 
         self.stop_base()
         self.bus1.disconnect(self.config.disable_torque_on_disconnect)

@@ -31,7 +31,7 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
-from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+# from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 from lerobot.model.SO101Robot import SO101Kinematics
 
 from ..teleoperator import Teleoperator
@@ -429,6 +429,7 @@ class XLerobotVRTeleop(Teleoperator):
         # 基座速度控制
         self.current_base_speed = 0.0
         self.last_update_time = time.time()
+        self.last_event_update_time = 0.0
         self.is_accelerating = False
         
         # 状态标志
@@ -484,12 +485,12 @@ class XLerobotVRTeleop(Teleoperator):
     def connect(self, calibrate: bool = True, robot=None) -> None:
         """建立VR连接 - 优化版本"""
         if self.is_connected:
-            raise DeviceAlreadyConnectedError(
+            raise RuntimeError(
                 "XLerobot VR is already connected. Do not run `connect()` twice."
             )
 
         if not VR_AVAILABLE:
-            raise DeviceNotConnectedError(
+            raise RuntimeError(
                 "VR Monitor is not available. Please check VR system installation."
             )
 
@@ -538,7 +539,7 @@ class XLerobotVRTeleop(Teleoperator):
         except Exception as e:
             logger.error(f"[VR] Connection failed: {e}")
             self._connected = False
-            raise DeviceNotConnectedError(f"Failed to connect to VR: {e}")
+            raise RuntimeError(f"Failed to connect to VR: {e}")
 
     def calibrate(self, robot_obs: Optional[Dict] = None) -> None:
         """校准VR控制器 - 优化版本"""
@@ -676,7 +677,7 @@ class XLerobotVRTeleop(Teleoperator):
     def disconnect(self) -> None:
         """断开VR连接"""
         if not self.is_connected:
-            raise DeviceNotConnectedError(
+            raise RuntimeError(
                 "XLerobot VR is not connected."
             )
         
