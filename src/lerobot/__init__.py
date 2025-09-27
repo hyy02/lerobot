@@ -177,6 +177,7 @@ available_robots = [
     "aloha",
     "so100",
     "so101",
+    "xlerobot",
 ]
 
 # lists all available cameras from `lerobot/cameras`

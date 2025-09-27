@@ -444,7 +444,8 @@ class LeRobotDatasetMetadata:
         obj.repo_id = repo_id
         obj.root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
 
-        obj.root.mkdir(parents=True, exist_ok=False)
+        exist_ok = 'test' in repo_id
+        obj.root.mkdir(parents=True, exist_ok=exist_ok)
 
         features = {**features, **DEFAULT_FEATURES}
         _validate_feature_names(features)

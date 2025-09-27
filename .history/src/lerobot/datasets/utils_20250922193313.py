@@ -43,7 +43,6 @@ from lerobot.datasets.backward_compatibility import (
     BackwardCompatibilityError,
     ForwardCompatibilityError,
 )
-from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_STR
 from lerobot.utils.utils import is_valid_numpy_dtype_string
 
 DEFAULT_CHUNK_SIZE = 1000  # Max number of files per chunk
@@ -412,26 +411,6 @@ def load_image_as_numpy(
         img_array /= 255.0
     return img_array
 
-def decode_depth_from_video(depth_video: np.ndarray) -> np.ndarray:
-    """
-    Decode uint16 depth from 3-channel uint8 video format.
-    
-    Args:
-        depth_video: (H, W, 3) uint8 array where channels represent high/low 8 bits
-        
-    Returns:
-        np.ndarray: (H, W) uint16 depth array
-    """
-    if depth_video.shape[-1] != 3:
-        raise ValueError(f"Expected 3 channels for depth video, got {depth_video.shape[-1]}")
-    
-    high_channel = depth_video[..., 0].astype(np.uint16)
-    low_channel = depth_video[..., 1].astype(np.uint16) 
-    
-    # Reconstruct 16-bit depth: (high << 8) | low
-    depth_uint16 = (high_channel << 8) | low_channel
-    return depth_uint16
-
 
 def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[torch.Tensor | str]]:
     """Convert a batch from a Hugging Face dataset to torch tensors.
@@ -451,20 +430,8 @@ def hf_transform_to_torch(items_dict: dict[str, list[Any]]) -> dict[str, list[to
     for key in items_dict:
         first_item = items_dict[key][0]
         if isinstance(first_item, PILImage.Image):
-            # Check if this is a depth image (2-channel uint8 format)
-            if "_depth" in key and hasattr(first_item, 'size') and len(np.array(first_item).shape) == 3 and np.array(first_item).shape[2] == 3:
-                # Convert depth video back to uint16 depth images
-                depth_images = []
-                for img in items_dict[key]:
-                    depth_array = decode_depth_from_video(np.array(img))
-                    # Convert to float32 tensor and normalize to [0,1] range (assuming max depth ~10m = 10000mm)
-                    depth_tensor = torch.tensor(depth_array, dtype=torch.float32) / 10000.0
-                    depth_images.append(depth_tensor.unsqueeze(0))  # Add channel dimension
-                items_dict[key] = depth_images
-            else:
-                # Regular RGB image processing
-                to_tensor = transforms.ToTensor()
-                items_dict[key] = [to_tensor(img) for img in items_dict[key]]
+            to_tensor = transforms.ToTensor()
+            items_dict[key] = [to_tensor(img) for img in items_dict[key]]
         elif first_item is None:
             pass
         else:
@@ -678,14 +645,14 @@ def hw_to_dataset_features(
     }
     cam_fts = {key: shape for key, shape in hw_features.items() if isinstance(shape, tuple)}
 
-    if joint_fts and prefix == ACTION:
+    if joint_fts and prefix == "action":
         features[prefix] = {
             "dtype": "float32",
             "shape": (len(joint_fts),),
             "names": list(joint_fts),
         }
 
-    if joint_fts and prefix == OBS_STR:
+    if joint_fts and prefix == "observation":
         features[f"{prefix}.state"] = {
             "dtype": "float32",
             "shape": (len(joint_fts),),
@@ -693,19 +660,11 @@ def hw_to_dataset_features(
         }
 
     for key, shape in cam_fts.items():
-        if key.endswith("_depth"):
-            # Depth images: convert uint16 to 3-channel uint8 for video storage
-            features[f"{prefix}.images.{key}"] = {
-                "dtype": "video" if use_video else "image",
-                "shape": shape + (3,),  # Add 3 channels for uint16->uint8 conversion
-                "names": ["height", "width", "channels"],
-            }
-        else:
-            features[f"{prefix}.images.{key}"] = {
-                "dtype": "video" if use_video else "image",
-                "shape": shape,
-                "names": ["height", "width", "channels"],
-            }
+        features[f"{prefix}.images.{key}"] = {
+            "dtype": "video" if use_video else "image",
+            "shape": shape,
+            "names": ["height", "width", "channels"],
+        }
 
     _validate_feature_names(features)
     return features
@@ -735,20 +694,7 @@ def build_dataset_frame(
         elif ft["dtype"] == "float32" and len(ft["shape"]) == 1:
             frame[key] = np.array([values[name] for name in ft["names"]], dtype=np.float32)
         elif ft["dtype"] in ["image", "video"]:
-            # frame[key] = values[key.removeprefix(f"{prefix}.images.")]
-            raw_key = key.removeprefix(f"{prefix}.images.")
-            raw_value = values[raw_key]
-            
-            # Convert uint16 depth to 2-channel uint8 for video compression
-            if raw_key.endswith("_depth") and isinstance(raw_value, np.ndarray) and raw_value.dtype == np.uint16:
-                # Split 16-bit values into high and low 8-bit channels for lossless compression
-                high_channel = (raw_value >> 8).astype(np.uint8)  # Upper 8 bits
-                low_channel = (raw_value & 0xFF).astype(np.uint8)  # Lower 8 bits
-                zero_channel = np.zeros_like(high_channel, dtype=np.uint8)
-                # Stack channels to create (H, W, 2) array compatible with video format
-                frame[key] = np.stack([high_channel, low_channel, zero_channel], axis=-1)
-            else:
-                frame[key] = raw_value
+            frame[key] = values[key.removeprefix(f"{prefix}.images.")]
 
     return frame
 
@@ -782,11 +728,11 @@ def dataset_to_policy_features(features: dict[str, dict]) -> dict[str, PolicyFea
             # Backward compatibility for "channel" which is an error introduced in LeRobotDataset v2.0 for ported datasets.
             if names[2] in ["channel", "channels"]:  # (h, w, c) -> (c, h, w)
                 shape = (shape[2], shape[0], shape[1])
-        elif key == OBS_ENV_STATE:
+        elif key == "observation.environment_state":
             type = FeatureType.ENV
-        elif key.startswith(OBS_STR):
+        elif key.startswith("observation"):
             type = FeatureType.STATE
-        elif key.startswith(ACTION):
+        elif key.startswith("action"):
             type = FeatureType.ACTION
         else:
             continue

@@ -29,7 +29,7 @@ try:
 except Exception as e:
     logging.info(f"Could not import realsense: {e}")
 
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from ..camera import Camera
 from ..configs import ColorMode
@@ -307,55 +307,6 @@ class RealSenseCamera(Camera):
             else:
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
-    
-    def read_rgb_depth(self, color_mode: ColorMode | None = None, timeout_ms: int = 200) -> tuple[np.ndarray, np.ndarray | None]:
-        """
-        Reads both RGB and depth frames synchronously from the camera in a single pipeline call.
-        
-        This is more efficient than calling read() and read_depth() separately as it only
-        makes one call to the pipeline.
-
-        Args:
-            color_mode: Color mode for the RGB frame processing
-            timeout_ms (int): Maximum time in milliseconds to wait for frames. Defaults to 200ms.
-
-        Returns:
-            tuple[np.ndarray, np.ndarray | None]: A tuple containing:
-                - RGB frame as NumPy array (height, width, channels)
-                - Depth frame as NumPy array (height, width) or None if depth not enabled
-
-        Raises:
-            DeviceNotConnectedError: If the camera is not connected.
-            RuntimeError: If reading frames from the pipeline fails or frames are invalid.
-        """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
-        start_time = time.perf_counter()
-
-        ret, frame = self.rs_pipeline.try_wait_for_frames(timeout_ms=timeout_ms)
-
-        if not ret or frame is None:
-            raise RuntimeError(f"{self} read_rgb_depth failed (status={ret}).")
-
-        # Process RGB frame (always required)
-        color_frame = frame.get_color_frame()
-        if not color_frame:
-            raise RuntimeError(f"{self} read_rgb_depth failed: No color frame available.")
-
-        color_image_raw = np.asanyarray(color_frame.get_data())
-        color_image_processed = self._postprocess_image(color_image_raw, color_mode)
-        
-        # Process depth frame if enabled
-        depth_image_processed = None
-        depth_frame = frame.get_depth_frame()
-        depth_map = np.asanyarray(depth_frame.get_data())
-        depth_image_processed = self._postprocess_image(depth_map, depth_frame=True)
-
-        read_duration_ms = (time.perf_counter() - start_time) * 1e3
-        logger.debug(f"{self} read_rgb_depth took: {read_duration_ms:.1f}ms")
-
-        return color_image_processed, depth_image_processed
 
     def read_depth(self, timeout_ms: int = 200) -> np.ndarray:
         """

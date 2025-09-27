@@ -21,12 +21,11 @@ Example:
 lerobot-record \
     --robot.type=so100_follower \
     --robot.port=/dev/tty.usbmodem58760431541 \
-    --robot.cameras="{laptop: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" \
+    --robot.cameras="{laptop: {type: opencv, camera_index: 0, width: 640, height: 480}}" \
     --robot.id=black \
-    --dataset.repo_id=<my_username>/<my_dataset_name> \
+    --dataset.repo_id=aliberts/record-test \
     --dataset.num_episodes=2 \
     --dataset.single_task="Grab the cube" \
-    --display_data=true
     # <- Teleop optional if you want to teleoperate to record or in between episodes with a policy \
     # --teleop.type=so100_leader \
     # --teleop.port=/dev/tty.usbmodem58760431551 \
@@ -60,10 +59,9 @@ lerobot-record \
 
 import logging
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from pprint import pformat
-from typing import Any
 
 from lerobot.cameras import (  # noqa: F401
     CameraConfig,  # noqa: F401
@@ -74,20 +72,10 @@ from lerobot.configs import parser
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
-from lerobot.datasets.utils import build_dataset_frame, combine_feature_dicts
+from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
 from lerobot.datasets.video_utils import VideoEncodingManager
-from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.policies.factory import make_policy
 from lerobot.policies.pretrained import PreTrainedPolicy
-from lerobot.processor import (
-    PolicyAction,
-    PolicyProcessorPipeline,
-    RobotAction,
-    RobotObservation,
-    RobotProcessorPipeline,
-    make_default_processors,
-)
-from lerobot.processor.rename_processor import rename_stats
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -97,6 +85,7 @@ from lerobot.robots import (  # noqa: F401
     make_robot_from_config,
     so100_follower,
     so101_follower,
+    xlerobot,
 )
 from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
@@ -107,9 +96,10 @@ from lerobot.teleoperators import (  # noqa: F401
     make_teleoperator_from_config,
     so100_leader,
     so101_leader,
+    xlerobot_vr,
 )
 from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.teleoperators.xlerobot_vr.xlerobot_vr import XLerobotVRTeleop, init_vr_listener
 from lerobot.utils.control_utils import (
     init_keyboard_listener,
     is_headless,
@@ -123,7 +113,7 @@ from lerobot.utils.utils import (
     init_logging,
     log_say,
 )
-from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import _init_rerun, log_rerun_data
 
 
 @dataclass
@@ -139,13 +129,13 @@ class DatasetRecordConfig:
     # Number of seconds for data recording for each episode.
     episode_time_s: int | float = 60
     # Number of seconds for resetting the environment after each episode.
-    reset_time_s: int | float = 60
+    reset_time_s: int | float = 5
     # Number of episodes to record.
     num_episodes: int = 50
     # Encode frames in the dataset into video
     video: bool = True
     # Upload dataset to Hugging Face hub.
-    push_to_hub: bool = True
+    push_to_hub: bool = False
     # Upload on private repository on the Hugging Face hub.
     private: bool = False
     # Add tags to your dataset on the hub.
@@ -162,8 +152,6 @@ class DatasetRecordConfig:
     # Number of episodes to record before batch encoding videos
     # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
     video_encoding_batch_size: int = 1
-    # Rename map for the observation to override the image and state keys
-    rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.single_task is None:
@@ -202,55 +190,14 @@ class RecordConfig:
         return ["policy"]
 
 
-""" --------------- record_loop() data flow --------------------------
-       [ Robot ]
-           V
-     [ robot.get_observation() ] ---> raw_obs
-           V
-     [ robot_observation_processor ] ---> processed_obs
-           V
-     .-----( ACTION LOGIC )------------------.
-     V                                       V
-     [ From Teleoperator ]                   [ From Policy ]
-     |                                       |
-     |  [teleop.get_action] -> raw_action    |   [predict_action]
-     |          |                            |          |
-     |          V                            |          V
-     | [teleop_action_processor]             |          |
-     |          |                            |          |
-     '---> processed_teleop_action           '---> processed_policy_action
-     |                                       |
-     '-------------------------.-------------'
-                               V
-                  [ robot_action_processor ] --> robot_action_to_send
-                               V
-                    [ robot.send_action() ] -- (Robot Executes)
-                               V
-                    ( Save to Dataset )
-                               V
-                  ( Rerun Log / Loop Wait )
-"""
-
-
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
     events: dict,
     fps: int,
-    teleop_action_processor: RobotProcessorPipeline[
-        tuple[RobotAction, RobotObservation], RobotAction
-    ],  # runs after teleop
-    robot_action_processor: RobotProcessorPipeline[
-        tuple[RobotAction, RobotObservation], RobotAction
-    ],  # runs before robot
-    robot_observation_processor: RobotProcessorPipeline[
-        RobotObservation, RobotObservation
-    ],  # runs after robot
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
     policy: PreTrainedPolicy | None = None,
-    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
-    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
@@ -282,61 +229,55 @@ def record_loop(
                 "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
             )
 
-    # Reset policy and processor if they are provided
-    if policy is not None and preprocessor is not None and postprocessor is not None:
+    # if policy is given it needs cleaning up
+    if policy is not None:
         policy.reset()
-        preprocessor.reset()
-        postprocessor.reset()
 
     timestamp = 0
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
+        current_events = teleop.get_vr_events()
+        events.update(current_events)
+
+
         if events["exit_early"]:
             events["exit_early"] = False
+            log_say("Exit early")
+            time.sleep(1)
             break
 
-        # Get robot observation
-        obs = robot.get_observation()
-
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
-        obs_processed = robot_observation_processor(obs)
+        try:
+            observation = robot.get_observation()
+        except TimeoutError as e:
+            logging.warning(f"Camera timeout: {e}. Skipping this frame.")
+            continue  # 跳过当前帧，继续循环
 
         if policy is not None or dataset is not None:
-            observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
+            observation_frame = build_dataset_frame(dataset.features, observation, prefix="observation")
 
-        # Get action from either policy or teleop
-        if policy is not None and preprocessor is not None and postprocessor is not None:
+        if policy is not None:
             action_values = predict_action(
-                observation=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
+                observation_frame,
+                policy,
+                get_safe_torch_device(policy.config.device),
+                policy.config.use_amp,
                 task=single_task,
                 robot_type=robot.robot_type,
             )
-
-            action_names = dataset.features[ACTION]["names"]
-            act_processed_policy: RobotAction = {
-                f"{name}": float(action_values[i]) for i, name in enumerate(action_names)
-            }
-
+            action = {key: action_values[i].item() for i, key in enumerate(robot.action_features)}
         elif policy is None and isinstance(teleop, Teleoperator):
-            act = teleop.get_action()
-
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
-            act_processed_teleop = teleop_action_processor((act, obs))
-
+            action = teleop.get_action(observation, robot)
         elif policy is None and isinstance(teleop, list):
+            # TODO(pepijn, steven): clean the record loop for use of multiple robots (possibly with pipeline)
             arm_action = teleop_arm.get_action()
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
+
             keyboard_action = teleop_keyboard.get_action()
             base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
-            act_processed_teleop = teleop_action_processor((act, obs))
+
+            action = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
         else:
             logging.info(
                 "No policy or teleoperator provided, skipping action generation."
@@ -345,28 +286,24 @@ def record_loop(
             )
             continue
 
-        # Applies a pipeline to the action, default is IdentityProcessor
-        if policy is not None and act_processed_policy is not None:
-            action_values = act_processed_policy
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-        else:
-            action_values = act_processed_teleop
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
-
-        # Send action to robot
         # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
-        _sent_action = robot.send_action(robot_action_to_send)
+        # so action actually sent is saved in the dataset.
 
-        # Write to dataset
+        if events["reset_position"]:
+            logging.info("Rest to the zero position of robot")
+            log_say("Reset position")
+            action = teleop.move_to_zero_position(robot)
+            events["reset_position"] = False  # 重置事件状态
+            
+        sent_action = robot.send_action(action)
+
         if dataset is not None:
-            action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+            action_frame = build_dataset_frame(dataset.features, sent_action, prefix="action")
             frame = {**observation_frame, **action_frame, "task": single_task}
             dataset.add_frame(frame)
 
         if display_data:
-            log_rerun_data(observation=obs_processed, action=action_values)
+            log_rerun_data(observation, action)
 
         dt_s = time.perf_counter() - start_loop_t
         busy_wait(1 / fps - dt_s)
@@ -379,27 +316,14 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     init_logging()
     logging.info(pformat(asdict(cfg)))
     if cfg.display_data:
-        init_rerun(session_name="recording")
+        _init_rerun(session_name="recording")
 
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
-
-    dataset_features = combine_feature_dicts(
-        aggregate_pipeline_dataset_features(
-            pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
-            use_videos=cfg.dataset.video,
-        ),
-        aggregate_pipeline_dataset_features(
-            pipeline=robot_observation_processor,
-            initial_features=create_initial_features(observation=robot.observation_features),
-            use_videos=cfg.dataset.video,
-        ),
-    )
+    action_features = hw_to_dataset_features(robot.action_features, "action", cfg.dataset.video)
+    obs_features = hw_to_dataset_features(robot.observation_features, "observation", cfg.dataset.video)
+    dataset_features = {**action_features, **obs_features}
 
     if cfg.resume:
         dataset = LeRobotDataset(
@@ -431,24 +355,21 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
     # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
-    preprocessor = None
-    postprocessor = None
-    if cfg.policy is not None:
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy_cfg=cfg.policy,
-            pretrained_path=cfg.policy.pretrained_path,
-            dataset_stats=rename_stats(dataset.meta.stats, cfg.dataset.rename_map),
-            preprocessor_overrides={
-                "device_processor": {"device": cfg.policy.device},
-                "rename_observations_processor": {"rename_map": cfg.dataset.rename_map},
-            },
-        )
 
     robot.connect()
     if teleop is not None:
-        teleop.connect()
+        teleop.connect(robot=robot)
+        teleop.send_feedback()
 
-    listener, events = init_keyboard_listener()
+    # 根据teleop类型选择合适的事件监听器
+    if isinstance(teleop, XLerobotVRTeleop):
+        # 使用VR事件监听器
+        listener, events = init_vr_listener(teleop)
+        logging.info("🎮 使用VR左手柄控制录制状态")
+    else:
+        # 使用传统键盘监听器
+        listener, events = init_keyboard_listener()
+        logging.info("⌨️ 使用键盘控制录制状态")
 
     with VideoEncodingManager(dataset):
         recorded_episodes = 0
@@ -458,13 +379,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 robot=robot,
                 events=events,
                 fps=cfg.dataset.fps,
-                teleop_action_processor=teleop_action_processor,
-                robot_action_processor=robot_action_processor,
-                robot_observation_processor=robot_observation_processor,
                 teleop=teleop,
                 policy=policy,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
                 dataset=dataset,
                 control_time_s=cfg.dataset.episode_time_s,
                 single_task=cfg.dataset.single_task,
@@ -476,26 +392,27 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             if not events["stop_recording"] and (
                 (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
             ):
-                log_say("Reset the environment", cfg.play_sounds)
+                log_say("Reset environment", cfg.play_sounds)
                 record_loop(
                     robot=robot,
                     events=events,
                     fps=cfg.dataset.fps,
-                    teleop_action_processor=teleop_action_processor,
-                    robot_action_processor=robot_action_processor,
-                    robot_observation_processor=robot_observation_processor,
                     teleop=teleop,
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    dataset=None,
                 )
 
             if events["rerecord_episode"]:
-                log_say("Re-record episode", cfg.play_sounds)
+                log_say("Again record", cfg.play_sounds)
                 events["rerecord_episode"] = False
                 events["exit_early"] = False
                 dataset.clear_episode_buffer()
+                time.sleep(1)
                 continue
+
+            log_say("Saving Episode", cfg.play_sounds, blocking=True)
 
             dataset.save_episode()
             recorded_episodes += 1
